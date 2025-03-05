@@ -14,7 +14,7 @@ os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 
 # Google Gemini API Keys with Rotation
 API_KEYS = [
-    "AIzaSyAYIIwHicFzIv2gYRUvk2pfEsnqVje9TfA",
+    "AIzaSyA77rBG8EaTlCzwwf_SCgAOVeQS11kbi8s",
     "AIzaSyAznPx4tiDhm5hnt1w1qQSoNjxEQgV4KUQ",
     "AIzaSyDmbj626LuMQwAJcmaJZwzdYfOdR_U96KI",
     "AIzaSyBAyUq6fntEPR4DN7WWWw0KlyTOdrhRUac"
@@ -29,7 +29,6 @@ def rotate_api_key():
     global current_api_index
     current_api_index = (current_api_index + 1) % len(API_KEYS)
     set_api_key()
-    st.warning(f"🔄 Switched to API Key {current_api_index + 1}")
 
 # Initialize the first API key
 set_api_key()
@@ -49,6 +48,33 @@ def extract_contact_info(resume_text):
     phone = phones[0] if phones else "N/A"
 
     return email, phone
+
+async def extract_candidate_name_with_gemini(resume_text):
+    prompt = f"""
+    Extract only the **candidate's full name** from the following resume text.
+
+    Resume Text:
+    {resume_text}
+
+    Please only return the full name (first name and last name) in a single line. 
+    If the name cannot be found, return "Unknown".
+    """
+
+    while True:
+        try:
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(prompt)
+            name = response.text.strip()
+
+            if len(name.split()) >= 2 and len(name) < 50:
+                return name
+            else:
+                return "Unknown"
+        except Exception as e:
+            if "429" in str(e):  # Quota exhausted error handling - silent retry
+                rotate_api_key()
+            else:
+                return "Unknown"
 
 async def analyze_resume(resume_text, filename, job_description, min_experience, min_ats_score):
     prompt = f"""
@@ -101,29 +127,31 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
                 "extracted_skills": extracted_skills
             }
         except Exception as e:
-            st.error(f"⚠️ Gemini API Error: {e}")
-            rotate_api_key()
+            if "429" in str(e):  # Quota exhausted - silently rotate key
+                rotate_api_key()
+            else:
+                st.error(f"Unexpected Error during resume analysis: {e}")
+                return None
 
 # Streamlit UI
 st.title("📄 CubeAI Resume Filtering Bot")
 st.subheader("Upload resumes and filter them based on your Job Description using Google Gemini AI.")
 
-# File uploader for bulk resumes
-uploaded_files = st.file_uploader("Upload up to 20 resumes (PDF only)", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload up to 100 resumes (PDF only)", type=["pdf"], accept_multiple_files=True)
 
-# Job Description input
+if uploaded_files and len(uploaded_files) > 100:
+    st.error("You can upload a maximum of 100 resumes at once.")
+    uploaded_files = uploaded_files[:100]  # Truncate to 100 resumes if more were uploaded
+
 job_description = st.text_area("Paste Job Description (JD) here", height=150)
 
-# Experience & ATS filter inputs
 min_experience = st.number_input("Minimum Required Experience (in years)", min_value=0, value=0)
 min_ats_score = st.slider("Minimum ATS Score", 0, 100, 70)
 
-# Process button
 if st.button("Start Filtering Process"):
     if not uploaded_files or not job_description:
         st.error("Please upload resumes and provide a Job Description.")
     else:
-        # Save files to disk
         file_paths = []
         for file in uploaded_files:
             file_path = os.path.join(UPLOAD_DIRECTORY, file.name)
@@ -131,7 +159,6 @@ if st.button("Start Filtering Process"):
                 f.write(file.read())
             file_paths.append(file_path)
 
-        # Run filtering process
         st.info("🔍 Processing resumes...")
         matching_resumes = []
         progress_bar = st.progress(0)
@@ -139,6 +166,8 @@ if st.button("Start Filtering Process"):
         for idx, file_path in enumerate(file_paths):
             resume_text = extract_text_from_pdf(file_path)
             email, phone = extract_contact_info(resume_text)
+
+            candidate_name = asyncio.run(extract_candidate_name_with_gemini(resume_text))
 
             analysis = asyncio.run(
                 analyze_resume(
@@ -150,40 +179,40 @@ if st.button("Start Filtering Process"):
                 )
             )
 
-            if analysis["is_match"]:
+            if analysis and analysis["is_match"]:
                 matching_resumes.append({
-                    "filename": os.path.basename(file_path),
+                    "candidate_name": candidate_name,
                     "ats_score": analysis["ats_score"],
                     "match_details": analysis["match_details"],
                     "skills": analysis["extracted_skills"],
                     "email": email,
                     "phone": phone,
-                    "download_link": f"uploaded_resumes/{quote(os.path.basename(file_path))}"
+                    "download_link": f"{UPLOAD_DIRECTORY}/{quote(os.path.basename(file_path))}"
                 })
 
             progress_bar.progress((idx + 1) / len(file_paths))
 
-        # Sort by ATS score
         matching_resumes = sorted(matching_resumes, key=lambda x: x["ats_score"], reverse=True)
 
-        # Display results in table format
         if matching_resumes:
             st.success(f"✅ Process completed! {len(matching_resumes)} resumes matched the criteria.")
             df = pd.DataFrame(matching_resumes)
 
-            # Convert the download links into clickable view links
-            df["View"] = df["download_link"].apply(lambda x: f"[View Resume]({x})")
+            df["View"] = df["download_link"].apply(lambda x: f'<a href="{x}" target="_blank">View Resume</a>')
 
-            # Display table with selected columns
-            st.write(
-                df[["filename", "ats_score", "skills", "email", "phone", "View"]].rename(columns={
-                    "filename": "Resume",
+            st.write("### 📝 Filtered Resumes:")
+
+            st.markdown(
+                df[["candidate_name", "ats_score", "skills", "email", "phone", "View"]]
+                .rename(columns={
+                    "candidate_name": "Candidate Name",
                     "ats_score": "ATS Score",
                     "skills": "Skills",
                     "email": "Email",
                     "phone": "Phone",
                     "View": "View"
-                }),
+                })
+                .to_html(index=False, escape=False),
                 unsafe_allow_html=True
             )
         else:
