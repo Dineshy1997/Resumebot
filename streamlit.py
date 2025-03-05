@@ -134,7 +134,7 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
                 return None
 
 # Streamlit UI
-st.title("📄 CubeAI Resume Filtering Bot")
+st.title("📄 Resume Filtering Bot")
 st.subheader("Upload resumes and filter them based on your Job Description using Google Gemini AI.")
 
 uploaded_files = st.file_uploader("Upload up to 100 resumes (PDF only)", type=["pdf"], accept_multiple_files=True)
