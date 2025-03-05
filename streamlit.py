@@ -2,6 +2,7 @@ import os
 import re
 import json
 import asyncio
+import base64
 import streamlit as st
 import pdfplumber
 import google.generativeai as genai
@@ -38,6 +39,15 @@ def extract_text_from_pdf(pdf_path):
         for page in pdf.pages:
             text += page.extract_text() or ""
     return text
+
+# Function to create download link for PDF
+def get_pdf_download_link(file_path, file_name):
+    """Generate a download link for a PDF file"""
+    with open(file_path, "rb") as f:
+        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
+    
+    href = f'<a href="data:application/pdf;base64,{base64_pdf}" download="{file_name}" target="_blank">View Resume</a>'
+    return href
 
 # Improved contact info extraction
 def extract_contact_info_and_name(resume_text):
@@ -162,30 +172,40 @@ if st.button("Start Filtering Process"):
 
         st.info("🔍 Processing resumes...")
         matching_resumes = []
+        processed_files = {}  # Dictionary to track which files match
         progress_bar = st.progress(0)
 
         for idx, file_path in enumerate(file_paths):
-            resume_text = extract_text_from_pdf(file_path)
-            candidate_name, email, phone = extract_contact_info_and_name(resume_text)
+            try:
+                resume_text = extract_text_from_pdf(file_path)
+                candidate_name, email, phone = extract_contact_info_and_name(resume_text)
 
-            analysis = asyncio.run(analyze_resume(
-                resume_text,
-                os.path.basename(file_path),
-                job_description,
-                min_experience,
-                min_ats_score
-            ))
+                analysis = asyncio.run(analyze_resume(
+                    resume_text,
+                    os.path.basename(file_path),
+                    job_description,
+                    min_experience,
+                    min_ats_score
+                ))
 
-            if analysis and analysis["is_match"]:
-                matching_resumes.append({
-                    "Candidate Name": candidate_name,
-                    "ATS Score": analysis["ats_score"],
-                    "Skills": analysis["extracted_skills"].replace(", ", "\n"),  # Display skills line-by-line
-                    "Email": email,
-                    "Phone": phone,
-                    "View": f'<a href="{file_path}" target="_blank">View Resume</a>'
-                })
+                file_name = os.path.basename(file_path)
+                processed_files[file_name] = analysis and analysis["is_match"]
 
+                if analysis and analysis["is_match"]:
+                    # Generate download link for the PDF
+                    download_link = get_pdf_download_link(file_path, file_name)
+                    
+                    matching_resumes.append({
+                        "Candidate Name": candidate_name,
+                        "ATS Score": analysis["ats_score"],
+                        "Skills": analysis["extracted_skills"].replace(", ", "\n"),  # Display skills line-by-line
+                        "Email": email,
+                        "Phone": phone,
+                        "View": download_link
+                    })
+            except Exception as e:
+                st.error(f"Error processing {os.path.basename(file_path)}: {e}")
+            
             progress_bar.progress((idx + 1) / len(file_paths))
 
         if matching_resumes:
@@ -197,5 +217,12 @@ if st.button("Start Filtering Process"):
                 df.to_html(index=False, escape=False).replace("\\n", "<br>"),
                 unsafe_allow_html=True
             )
+            
+            # Add summary of results
+            st.subheader("Processing Summary")
+            st.write(f"Total Resumes: {len(file_paths)}")
+            st.write(f"Matching Resumes: {len(matching_resumes)}")
+            st.write(f"Rejected Resumes: {len(file_paths) - len(matching_resumes)}")
+            
         else:
             st.warning("No resumes matched the criteria.")
