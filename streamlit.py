@@ -3,7 +3,7 @@ import re
 import json
 import asyncio
 import streamlit as st
-from PyPDF2 import PdfReader
+import pdfplumber
 import google.generativeai as genai
 from urllib.parse import quote
 import pandas as pd
@@ -14,7 +14,7 @@ os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 
 # Google Gemini API Keys with Rotation
 API_KEYS = [
-    "AIzaSyA77rBG8EaTlCzwwf_SCgAOVeQS11kbi8s",
+    "AIzaSyAYIIwHicFzIv2gYRUvk2pfEsnqVje9TfA",
     "AIzaSyAznPx4tiDhm5hnt1w1qQSoNjxEQgV4KUQ",
     "AIzaSyDmbj626LuMQwAJcmaJZwzdYfOdR_U96KI",
     "AIzaSyBAyUq6fntEPR4DN7WWWw0KlyTOdrhRUac"
@@ -30,55 +30,70 @@ def rotate_api_key():
     current_api_index = (current_api_index + 1) % len(API_KEYS)
     set_api_key()
 
-# Initialize the first API key
 set_api_key()
 
 def extract_text_from_pdf(pdf_path):
-    reader = PdfReader(pdf_path)
-    return "".join(page.extract_text() or "" for page in reader.pages)
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+    return text
 
-def extract_contact_info(resume_text):
+# Improved contact info extraction
+def extract_contact_info_and_name(resume_text):
     email_pattern = r'[a-zA-Z0-9+_.-]+@[a-zA-Z0-9.-]+'
-    phone_pattern = r'\b\d{10}\b'
+    
+    # More generalized phone pattern to catch international formats
+    phone_pattern = re.compile(r"""
+        (?:
+            (?:\+\d{1,3}[\s\-\.]?)?                # Optional country code with +
+            (?:\(?\d{1,4}\)?[\s\-\.]?)?           # Optional area code, possibly in parentheses
+            \d{3}[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}  # Main number groups
+            |
+            \d{10,12}                             # Simple 10-12 digit number
+        )
+    """, re.VERBOSE)
 
     emails = re.findall(email_pattern, resume_text)
-    phones = re.findall(phone_pattern, resume_text)
-
+    
+    # Find all potential phone numbers
+    phone_candidates = re.findall(phone_pattern, resume_text)
+    
+    # Clean up found phone numbers and keep valid ones
+    phones = []
+    for p in phone_candidates:
+        # Clean the phone number of spaces, dashes, dots, parentheses
+        cleaned = re.sub(r'[\s\-\.\(\)]', '', p)
+        # Keep only if it's a reasonable length for a phone number (7+ digits)
+        if len(cleaned) >= 7:
+            phones.append(p)
+    
+    # Fallback: Check for "Phone:", "Mobile:", "Contact:", "Tel:" prefixes
+    if not phones:
+        phone_prefix_pattern = re.compile(r'(?:Phone|Mobile|Contact|Tel|Cell)[:\s]*([+0-9\s\-\.\(\)]+)')
+        phone_matches = phone_prefix_pattern.findall(resume_text)
+        for p in phone_matches:
+            cleaned = re.sub(r'[\s\-\.\(\)]', '', p)
+            if len(cleaned) >= 7:
+                phones.append(p)
+    
     email = emails[0] if emails else "N/A"
     phone = phones[0] if phones else "N/A"
 
-    return email, phone
+    # Extract candidate name from the top lines (first 5 lines usually contain name)
+    lines = resume_text.split("\n")
+    candidate_name = "N/A"
+    for line in lines[:5]:
+        words = line.strip().split()
+        if len(words) >= 2 and all(word.isalpha() for word in words):
+            candidate_name = line.strip()
+            break
 
-async def extract_candidate_name_with_gemini(resume_text):
-    prompt = f"""
-    Extract only the **candidate's full name** from the following resume text.
-
-    Resume Text:
-    {resume_text}
-
-    Please only return the full name (first name and last name) in a single line. 
-    If the name cannot be found, return "Unknown".
-    """
-
-    while True:
-        try:
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
-            name = response.text.strip()
-
-            if len(name.split()) >= 2 and len(name) < 50:
-                return name
-            else:
-                return "Unknown"
-        except Exception as e:
-            if "429" in str(e):  # Quota exhausted error handling - silent retry
-                rotate_api_key()
-            else:
-                return "Unknown"
+    return candidate_name, email, phone
 
 async def analyze_resume(resume_text, filename, job_description, min_experience, min_ats_score):
     prompt = f"""
-    You are an advanced ATS system designed to evaluate resumes against job descriptions.
+    You are an ATS system evaluating resumes against job descriptions.
 
     JOB DESCRIPTION:
     {job_description}
@@ -86,19 +101,15 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
     RESUME CONTENT:
     {resume_text}
 
-    REQUIREMENTS:
-    - Minimum Experience Required: {min_experience} years
-    - Desired Skills & Qualifications: As described in the job description.
-
-    Please analyze this resume and return a structured JSON response with the following fields:
+    Please return a structured JSON object with:
     {{
-      "ats_score": (number from 0 to 100),
-      "meets_requirements": (true/false),
-      "match_details": "Brief explanation highlighting key matches or mismatches",
-      "extracted_skills": "Comma-separated list of relevant skills found in the resume"
+        "ats_score": (0 to 100),
+        "meets_requirements": (true/false),
+        "match_details": "Brief explanation highlighting matches or mismatches",
+        "extracted_skills": "Comma-separated list of relevant skills found in the resume"
     }}
 
-    Only return the JSON object. No extra text.
+    Only return valid JSON.
     """
 
     while True:
@@ -113,24 +124,17 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
             else:
                 raise ValueError(f"Invalid JSON response from Gemini: {response_text}")
 
-            ats_score = result.get("ats_score", 0)
-            meets_requirements = result.get("meets_requirements", False)
-            match_details = result.get("match_details", "No explanation provided")
-            extracted_skills = result.get("extracted_skills", "N/A")
-
-            is_match = meets_requirements and ats_score >= min_ats_score
-
             return {
-                "is_match": is_match,
-                "ats_score": ats_score,
-                "match_details": match_details,
-                "extracted_skills": extracted_skills
+                "is_match": result["meets_requirements"] and result["ats_score"] >= min_ats_score,
+                "ats_score": result["ats_score"],
+                "match_details": result["match_details"],
+                "extracted_skills": result["extracted_skills"]
             }
         except Exception as e:
-            if "429" in str(e):  # Quota exhausted - silently rotate key
+            if "429" in str(e):
                 rotate_api_key()
             else:
-                st.error(f"Unexpected Error during resume analysis: {e}")
+                st.error(f"Gemini Error: {e}")
                 return None
 
 # Streamlit UI
@@ -141,23 +145,20 @@ uploaded_files = st.file_uploader("Upload up to 100 resumes (PDF only)", type=["
 
 if uploaded_files and len(uploaded_files) > 100:
     st.error("You can upload a maximum of 100 resumes at once.")
-    uploaded_files = uploaded_files[:100]  # Truncate to 100 resumes if more were uploaded
+    uploaded_files = uploaded_files[:100]
 
-job_description = st.text_area("Paste Job Description (JD) here", height=150)
-
-min_experience = st.number_input("Minimum Required Experience (in years)", min_value=0, value=0)
+job_description = st.text_area("Paste Job Description (JD)", height=150)
+min_experience = st.number_input("Minimum Experience (years)", min_value=0, value=0)
 min_ats_score = st.slider("Minimum ATS Score", 0, 100, 70)
 
 if st.button("Start Filtering Process"):
     if not uploaded_files or not job_description:
-        st.error("Please upload resumes and provide a Job Description.")
+        st.error("Please upload resumes and paste a Job Description.")
     else:
-        file_paths = []
-        for file in uploaded_files:
-            file_path = os.path.join(UPLOAD_DIRECTORY, file.name)
-            with open(file_path, "wb") as f:
+        file_paths = [os.path.join(UPLOAD_DIRECTORY, file.name) for file in uploaded_files]
+        for file, path in zip(uploaded_files, file_paths):
+            with open(path, "wb") as f:
                 f.write(file.read())
-            file_paths.append(file_path)
 
         st.info("🔍 Processing resumes...")
         matching_resumes = []
@@ -165,54 +166,35 @@ if st.button("Start Filtering Process"):
 
         for idx, file_path in enumerate(file_paths):
             resume_text = extract_text_from_pdf(file_path)
-            email, phone = extract_contact_info(resume_text)
+            candidate_name, email, phone = extract_contact_info_and_name(resume_text)
 
-            candidate_name = asyncio.run(extract_candidate_name_with_gemini(resume_text))
-
-            analysis = asyncio.run(
-                analyze_resume(
-                    resume_text,
-                    os.path.basename(file_path),
-                    job_description,
-                    min_experience,
-                    min_ats_score
-                )
-            )
+            analysis = asyncio.run(analyze_resume(
+                resume_text,
+                os.path.basename(file_path),
+                job_description,
+                min_experience,
+                min_ats_score
+            ))
 
             if analysis and analysis["is_match"]:
                 matching_resumes.append({
-                    "candidate_name": candidate_name,
-                    "ats_score": analysis["ats_score"],
-                    "match_details": analysis["match_details"],
-                    "skills": analysis["extracted_skills"],
-                    "email": email,
-                    "phone": phone,
-                    "download_link": f"{UPLOAD_DIRECTORY}/{quote(os.path.basename(file_path))}"
+                    "Candidate Name": candidate_name,
+                    "ATS Score": analysis["ats_score"],
+                    "Skills": analysis["extracted_skills"].replace(", ", "\n"),  # Display skills line-by-line
+                    "Email": email,
+                    "Phone": phone,
+                    "View": f'<a href="{file_path}" target="_blank">View Resume</a>'
                 })
 
             progress_bar.progress((idx + 1) / len(file_paths))
 
-        matching_resumes = sorted(matching_resumes, key=lambda x: x["ats_score"], reverse=True)
-
         if matching_resumes:
-            st.success(f"✅ Process completed! {len(matching_resumes)} resumes matched the criteria.")
+            st.success(f"✅ Process completed! {len(matching_resumes)} resumes matched.")
             df = pd.DataFrame(matching_resumes)
 
-            df["View"] = df["download_link"].apply(lambda x: f'<a href="{x}" target="_blank">View Resume</a>')
-
-            st.write("### 📝 Filtered Resumes:")
-
+            # Render table with clickable links & formatted skills
             st.markdown(
-                df[["candidate_name", "ats_score", "skills", "email", "phone", "View"]]
-                .rename(columns={
-                    "candidate_name": "Candidate Name",
-                    "ats_score": "ATS Score",
-                    "skills": "Skills",
-                    "email": "Email",
-                    "phone": "Phone",
-                    "View": "View"
-                })
-                .to_html(index=False, escape=False),
+                df.to_html(index=False, escape=False).replace("\\n", "<br>"),
                 unsafe_allow_html=True
             )
         else:
