@@ -8,6 +8,7 @@ import pdfplumber
 import google.generativeai as genai
 from urllib.parse import quote
 import pandas as pd
+from datetime import datetime
 
 # Directory for storing resumes
 UPLOAD_DIRECTORY = "uploaded_resumes"
@@ -101,7 +102,19 @@ def extract_contact_info_and_name(resume_text):
 
     return candidate_name, email, phone
 
-async def analyze_resume(resume_text, filename, job_description, min_experience, min_ats_score):
+# Function to format experience in years and months
+def format_experience(total_months):
+    years = total_months // 12
+    months = total_months % 12
+    
+    if years > 0 and months > 0:
+        return f"{years} year{'s' if years > 1 else ''}, {months} month{'s' if months > 1 else ''}"
+    elif years > 0:
+        return f"{years} year{'s' if years > 1 else ''}"
+    else:
+        return f"{months} month{'s' if months > 1 else ''}"
+
+async def analyze_resume(resume_text, filename, job_description, min_experience_months, min_ats_score):
     prompt = f"""
     You are an ATS system evaluating resumes against job descriptions.
 
@@ -119,11 +132,15 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
         "meets_requirements": (true/false),
         "match_details": "Brief explanation highlighting matches or mismatches",
         "extracted_skills": "Comma-separated list of relevant skills found in the resume",
-        "total_years_experience": (integer representing total years of work experience, rounded to nearest whole number),
+        "experience_months": (integer representing total months of work experience),
         "experience_details": "Brief summary of relevant experience"
     }}
     
-    Do not include any explanations, conversations, or additional text outside the JSON object.
+    IMPORTANT NOTES:
+    - For experience_months, count ALL professional work experience in months (e.g., 3 years 6 months = 42 months)
+    - Be precise with experience calculation. Look at each job's start and end dates, and calculate the total months.
+    - For current jobs (with no end date), calculate months until present.
+    - Do not include any explanations, conversations, or additional text outside the JSON object.
     """
 
     while True:
@@ -148,30 +165,31 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
 
             # Validate that the JSON has all required fields
             required_fields = ["ats_score", "meets_requirements", "match_details", "extracted_skills", 
-                              "total_years_experience", "experience_details"]
+                              "experience_months", "experience_details"]
             if not all(field in result for field in required_fields):
                 rotate_api_key()
                 prompt += "\n\nIMPORTANT: The JSON response is missing required fields. Include ALL fields as specified."
                 continue
                 
-            # Ensure total_years_experience is an integer
-            if not isinstance(result["total_years_experience"], int):
+            # Ensure experience_months is an integer
+            if not isinstance(result["experience_months"], int):
                 try:
                     # Round to nearest integer if it's a float
-                    result["total_years_experience"] = round(float(result["total_years_experience"]))
+                    result["experience_months"] = round(float(result["experience_months"]))
                 except (ValueError, TypeError):
                     # If conversion fails, default to 0
-                    result["total_years_experience"] = 0
+                    result["experience_months"] = 0
 
             # Check if the candidate meets the minimum experience requirement
-            experience_requirement_met = result["total_years_experience"] >= min_experience
+            experience_requirement_met = result["experience_months"] >= min_experience_months
             
             return {
                 "is_match": result["meets_requirements"] and result["ats_score"] >= min_ats_score and experience_requirement_met,
                 "ats_score": result["ats_score"],
                 "match_details": result["match_details"],
                 "extracted_skills": result["extracted_skills"],
-                "total_years_experience": result["total_years_experience"],
+                "experience_months": result["experience_months"],
+                "formatted_experience": format_experience(result["experience_months"]),
                 "experience_details": result["experience_details"]
             }
         except Exception as e:
@@ -192,7 +210,17 @@ if uploaded_files and len(uploaded_files) > 100:
     uploaded_files = uploaded_files[:100]
 
 job_description = st.text_area("Paste Job Description (JD)", height=150)
-min_experience = st.number_input("Minimum Experience (years)", min_value=0, value=0)
+
+# Changed to collect experience in months for more precision
+col1, col2 = st.columns(2)
+with col1:
+    min_experience_years = st.number_input("Minimum Experience (years)", min_value=0, value=0)
+with col2:
+    min_experience_months = st.number_input("Additional months", min_value=0, max_value=11, value=0)
+
+# Calculate total minimum experience in months
+total_min_experience_months = (min_experience_years * 12) + min_experience_months
+
 min_ats_score = st.slider("Minimum ATS Score", 0, 100, 70)
 
 if st.button("Start Filtering Process"):
@@ -218,7 +246,7 @@ if st.button("Start Filtering Process"):
                     resume_text,
                     os.path.basename(file_path),
                     job_description,
-                    min_experience,
+                    total_min_experience_months,
                     min_ats_score
                 ))
 
@@ -229,11 +257,10 @@ if st.button("Start Filtering Process"):
                     # Generate download link for the PDF
                     download_link = get_pdf_download_link(file_path, file_name)
                     
-                    # Create result dictionary with experience column positioned after candidate name
-                    # Display experience as a whole number
+                    # Create result dictionary with formatted experience
                     result_dict = {
                         "Candidate Name": candidate_name,
-                        "Experience": f"{analysis['total_years_experience']} years",
+                        "Experience": analysis["formatted_experience"],
                         "ATS Score": analysis["ats_score"],
                         "Skills": analysis["extracted_skills"].replace(", ", "\n"),  # Display skills line-by-line
                         "Email": email,
