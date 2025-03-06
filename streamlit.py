@@ -111,15 +111,19 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
     RESUME CONTENT:
     {resume_text}
 
-    Please return a structured JSON object with:
+    INSTRUCTIONS:
+    Analyze the resume against the job description.
+    You MUST return a valid JSON object with exactly the following structure and nothing else:
     {{
-        "ats_score": (0 to 100),
+        "ats_score": (number between 0 to 100),
         "meets_requirements": (true/false),
         "match_details": "Brief explanation highlighting matches or mismatches",
-        "extracted_skills": "Comma-separated list of relevant skills found in the resume"
+        "extracted_skills": "Comma-separated list of relevant skills found in the resume",
+        "total_years_experience": (integer representing total years of work experience, rounded to nearest whole number),
+        "experience_details": "Brief summary of relevant experience"
     }}
-
-    Only return valid JSON.
+    
+    Do not include any explanations, conversations, or additional text outside the JSON object.
     """
 
     while True:
@@ -128,17 +132,47 @@ async def analyze_resume(resume_text, filename, job_description, min_experience,
             response = model.generate_content(prompt)
             response_text = response.text.strip()
 
-            json_text = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_text:
-                result = json.loads(json_text.group())
-            else:
-                raise ValueError(f"Invalid JSON response from Gemini: {response_text}")
+            # Try to parse the whole response as JSON first
+            try:
+                result = json.loads(response_text)
+            except json.JSONDecodeError:
+                # If that fails, try to extract JSON from the text
+                json_text = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_text:
+                    result = json.loads(json_text.group())
+                else:
+                    # If we can't find JSON, retry with a more forceful prompt
+                    rotate_api_key()
+                    prompt += "\n\nIMPORTANT: You MUST return ONLY a valid JSON object with no additional text."
+                    continue
 
+            # Validate that the JSON has all required fields
+            required_fields = ["ats_score", "meets_requirements", "match_details", "extracted_skills", 
+                              "total_years_experience", "experience_details"]
+            if not all(field in result for field in required_fields):
+                rotate_api_key()
+                prompt += "\n\nIMPORTANT: The JSON response is missing required fields. Include ALL fields as specified."
+                continue
+                
+            # Ensure total_years_experience is an integer
+            if not isinstance(result["total_years_experience"], int):
+                try:
+                    # Round to nearest integer if it's a float
+                    result["total_years_experience"] = round(float(result["total_years_experience"]))
+                except (ValueError, TypeError):
+                    # If conversion fails, default to 0
+                    result["total_years_experience"] = 0
+
+            # Check if the candidate meets the minimum experience requirement
+            experience_requirement_met = result["total_years_experience"] >= min_experience
+            
             return {
-                "is_match": result["meets_requirements"] and result["ats_score"] >= min_ats_score,
+                "is_match": result["meets_requirements"] and result["ats_score"] >= min_ats_score and experience_requirement_met,
                 "ats_score": result["ats_score"],
                 "match_details": result["match_details"],
-                "extracted_skills": result["extracted_skills"]
+                "extracted_skills": result["extracted_skills"],
+                "total_years_experience": result["total_years_experience"],
+                "experience_details": result["experience_details"]
             }
         except Exception as e:
             if "429" in str(e):
@@ -195,14 +229,19 @@ if st.button("Start Filtering Process"):
                     # Generate download link for the PDF
                     download_link = get_pdf_download_link(file_path, file_name)
                     
-                    matching_resumes.append({
+                    # Create result dictionary with experience column positioned after candidate name
+                    # Display experience as a whole number
+                    result_dict = {
                         "Candidate Name": candidate_name,
+                        "Experience": f"{analysis['total_years_experience']} years",
                         "ATS Score": analysis["ats_score"],
                         "Skills": analysis["extracted_skills"].replace(", ", "\n"),  # Display skills line-by-line
                         "Email": email,
                         "Phone": phone,
                         "View": download_link
-                    })
+                    }
+                    
+                    matching_resumes.append(result_dict)
             except Exception as e:
                 st.error(f"Error processing {os.path.basename(file_path)}: {e}")
             
@@ -210,7 +249,23 @@ if st.button("Start Filtering Process"):
 
         if matching_resumes:
             st.success(f"✅ Process completed! {len(matching_resumes)} resumes matched.")
+            
+            # Create DataFrame with columns in desired order
             df = pd.DataFrame(matching_resumes)
+            
+            # Ensure column order (for better table structure)
+            column_order = [
+                "Candidate Name", 
+                "Experience",
+                "ATS Score", 
+                "Skills", 
+                "Email", 
+                "Phone", 
+                "View"
+            ]
+            # Filter to only include columns that exist in the DataFrame
+            column_order = [col for col in column_order if col in df.columns]
+            df = df[column_order]
 
             # Render table with clickable links & formatted skills
             st.markdown(
