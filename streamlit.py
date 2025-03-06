@@ -1,13 +1,13 @@
 import os
 import re
 import json
-import base64
 import asyncio
+import base64
 import streamlit as st
 import pdfplumber
 import google.generativeai as genai
-import pandas as pd
 from urllib.parse import quote
+import pandas as pd
 
 # Directory for storing resumes
 UPLOAD_DIRECTORY = "uploaded_resumes"
@@ -30,11 +30,9 @@ def rotate_api_key():
     global current_api_index
     current_api_index = (current_api_index + 1) % len(API_KEYS)
     set_api_key()
-    st.warning(f"🔄 Switched to API Key {current_api_index + 1}")
 
 set_api_key()
 
-# Extract text from PDF using pdfplumber
 def extract_text_from_pdf(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
@@ -42,26 +40,68 @@ def extract_text_from_pdf(pdf_path):
             text += page.extract_text() or ""
     return text
 
-# Create downloadable link for resume
+# Function to create download link for PDF
 def get_pdf_download_link(file_path, file_name):
+    """Generate a download link for a PDF file"""
     with open(file_path, "rb") as f:
         base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    return f'<a href="data:application/pdf;base64,{base64_pdf}" download="{file_name}" target="_blank">View Resume</a>'
+    
+    href = f'<a href="data:application/pdf;base64,{base64_pdf}" download="{file_name}" target="_blank">View Resume</a>'
+    return href
 
-# Extract contact information (email, phone) using regex
-def extract_contact_info(resume_text):
-    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    phone_pattern = re.compile(r'(\+?\d[\d\s\-().]{8,}\d)')
+# Improved contact info extraction
+def extract_contact_info_and_name(resume_text):
+    email_pattern = r'[a-zA-Z0-9+_.-]+@[a-zA-Z0-9.-]+'
+    
+    # More generalized phone pattern to catch international formats
+    phone_pattern = re.compile(r"""
+        (?:
+            (?:\+\d{1,3}[\s\-\.]?)?                # Optional country code with +
+            (?:\(?\d{1,4}\)?[\s\-\.]?)?           # Optional area code, possibly in parentheses
+            \d{3}[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}  # Main number groups
+            |
+            \d{10,12}                             # Simple 10-12 digit number
+        )
+    """, re.VERBOSE)
 
     emails = re.findall(email_pattern, resume_text)
-    phones = re.findall(phone_pattern, resume_text)
-
+    
+    # Find all potential phone numbers
+    phone_candidates = re.findall(phone_pattern, resume_text)
+    
+    # Clean up found phone numbers and keep valid ones
+    phones = []
+    for p in phone_candidates:
+        # Clean the phone number of spaces, dashes, dots, parentheses
+        cleaned = re.sub(r'[\s\-\.\(\)]', '', p)
+        # Keep only if it's a reasonable length for a phone number (7+ digits)
+        if len(cleaned) >= 7:
+            phones.append(p)
+    
+    # Fallback: Check for "Phone:", "Mobile:", "Contact:", "Tel:" prefixes
+    if not phones:
+        phone_prefix_pattern = re.compile(r'(?:Phone|Mobile|Contact|Tel|Cell)[:\s]*([+0-9\s\-\.\(\)]+)')
+        phone_matches = phone_prefix_pattern.findall(resume_text)
+        for p in phone_matches:
+            cleaned = re.sub(r'[\s\-\.\(\)]', '', p)
+            if len(cleaned) >= 7:
+                phones.append(p)
+    
     email = emails[0] if emails else "N/A"
     phone = phones[0] if phones else "N/A"
-    return email, phone
 
-# Use Gemini to analyze resume and extract details including candidate name
-async def analyze_resume(resume_text, job_description, min_experience, min_ats_score):
+    # Extract candidate name from the top lines (first 5 lines usually contain name)
+    lines = resume_text.split("\n")
+    candidate_name = "N/A"
+    for line in lines[:5]:
+        words = line.strip().split()
+        if len(words) >= 2 and all(word.isalpha() for word in words):
+            candidate_name = line.strip()
+            break
+
+    return candidate_name, email, phone
+
+async def analyze_resume(resume_text, filename, job_description, min_experience, min_ats_score):
     prompt = f"""
     You are an ATS system evaluating resumes against job descriptions.
 
@@ -73,17 +113,17 @@ async def analyze_resume(resume_text, job_description, min_experience, min_ats_s
 
     INSTRUCTIONS:
     Analyze the resume against the job description.
-    Return a JSON object with this structure:
+    You MUST return a valid JSON object with exactly the following structure and nothing else:
     {{
-        "candidate_name": "Full candidate name extracted from resume",
-        "ats_score": (number between 0 and 100),
+        "ats_score": (number between 0 to 100),
         "meets_requirements": (true/false),
         "match_details": "Brief explanation highlighting matches or mismatches",
         "extracted_skills": "Comma-separated list of relevant skills found in the resume",
-        "total_years_experience": (integer rounded to nearest whole number),
+        "total_years_experience": (integer representing total years of work experience, rounded to nearest whole number),
         "experience_details": "Brief summary of relevant experience"
     }}
-    Only return the JSON object, no explanations or additional text.
+    
+    Do not include any explanations, conversations, or additional text outside the JSON object.
     """
 
     while True:
@@ -92,39 +132,48 @@ async def analyze_resume(resume_text, job_description, min_experience, min_ats_s
             response = model.generate_content(prompt)
             response_text = response.text.strip()
 
-            # Attempt to parse response directly as JSON
+            # Try to parse the whole response as JSON first
             try:
                 result = json.loads(response_text)
             except json.JSONDecodeError:
+                # If that fails, try to extract JSON from the text
                 json_text = re.search(r'\{.*\}', response_text, re.DOTALL)
                 if json_text:
                     result = json.loads(json_text.group())
                 else:
+                    # If we can't find JSON, retry with a more forceful prompt
                     rotate_api_key()
+                    prompt += "\n\nIMPORTANT: You MUST return ONLY a valid JSON object with no additional text."
                     continue
 
-            required_fields = [
-                "candidate_name", "ats_score", "meets_requirements",
-                "match_details", "extracted_skills",
-                "total_years_experience", "experience_details"
-            ]
+            # Validate that the JSON has all required fields
+            required_fields = ["ats_score", "meets_requirements", "match_details", "extracted_skills", 
+                              "total_years_experience", "experience_details"]
             if not all(field in result for field in required_fields):
                 rotate_api_key()
+                prompt += "\n\nIMPORTANT: The JSON response is missing required fields. Include ALL fields as specified."
                 continue
-
+                
+            # Ensure total_years_experience is an integer
             if not isinstance(result["total_years_experience"], int):
-                result["total_years_experience"] = round(float(result.get("total_years_experience", 0)))
+                try:
+                    # Round to nearest integer if it's a float
+                    result["total_years_experience"] = round(float(result["total_years_experience"]))
+                except (ValueError, TypeError):
+                    # If conversion fails, default to 0
+                    result["total_years_experience"] = 0
 
+            # Check if the candidate meets the minimum experience requirement
             experience_requirement_met = result["total_years_experience"] >= min_experience
-            is_match = (
-                result["meets_requirements"] and 
-                result["ats_score"] >= min_ats_score and 
-                experience_requirement_met
-            )
-
-            result["is_match"] = is_match
-            return result
-
+            
+            return {
+                "is_match": result["meets_requirements"] and result["ats_score"] >= min_ats_score and experience_requirement_met,
+                "ats_score": result["ats_score"],
+                "match_details": result["match_details"],
+                "extracted_skills": result["extracted_skills"],
+                "total_years_experience": result["total_years_experience"],
+                "experience_details": result["experience_details"]
+            }
         except Exception as e:
             if "429" in str(e):
                 rotate_api_key()
@@ -157,49 +206,78 @@ if st.button("Start Filtering Process"):
 
         st.info("🔍 Processing resumes...")
         matching_resumes = []
+        processed_files = {}  # Dictionary to track which files match
         progress_bar = st.progress(0)
 
         for idx, file_path in enumerate(file_paths):
             try:
                 resume_text = extract_text_from_pdf(file_path)
-                email, phone = extract_contact_info(resume_text)
+                candidate_name, email, phone = extract_contact_info_and_name(resume_text)
 
                 analysis = asyncio.run(analyze_resume(
-                    resume_text, job_description, min_experience, min_ats_score
+                    resume_text,
+                    os.path.basename(file_path),
+                    job_description,
+                    min_experience,
+                    min_ats_score
                 ))
 
+                file_name = os.path.basename(file_path)
+                processed_files[file_name] = analysis and analysis["is_match"]
+
                 if analysis and analysis["is_match"]:
-                    matching_resumes.append({
-                        "Candidate Name": analysis["candidate_name"],
-                        "Experience": f'{analysis["total_years_experience"]} years',
+                    # Generate download link for the PDF
+                    download_link = get_pdf_download_link(file_path, file_name)
+                    
+                    # Create result dictionary with experience column positioned after candidate name
+                    # Display experience as a whole number
+                    result_dict = {
+                        "Candidate Name": candidate_name,
+                        "Experience": f"{analysis['total_years_experience']} years",
                         "ATS Score": analysis["ats_score"],
-                        "Skills": analysis["extracted_skills"].replace(", ", "<br>"),
+                        "Skills": analysis["extracted_skills"].replace(", ", "\n"),  # Display skills line-by-line
                         "Email": email,
                         "Phone": phone,
-                        "View": get_pdf_download_link(file_path, os.path.basename(file_path))
-                    })
+                        "View": download_link
+                    }
+                    
+                    matching_resumes.append(result_dict)
             except Exception as e:
                 st.error(f"Error processing {os.path.basename(file_path)}: {e}")
-
+            
             progress_bar.progress((idx + 1) / len(file_paths))
 
         if matching_resumes:
-            st.success(f"✅ Process completed! {len(matching_resumes)} resumes matched the criteria.")
-
+            st.success(f"✅ Process completed! {len(matching_resumes)} resumes matched.")
+            
+            # Create DataFrame with columns in desired order
             df = pd.DataFrame(matching_resumes)
-
+            
+            # Ensure column order (for better table structure)
             column_order = [
-                "Candidate Name", "Experience", "ATS Score",
-                "Skills", "Email", "Phone", "View"
+                "Candidate Name", 
+                "Experience",
+                "ATS Score", 
+                "Skills", 
+                "Email", 
+                "Phone", 
+                "View"
             ]
+            # Filter to only include columns that exist in the DataFrame
+            column_order = [col for col in column_order if col in df.columns]
             df = df[column_order]
 
-            # Display results table with clickable view links and skills line by line
+            # Render table with clickable links & formatted skills
             st.markdown(
                 df.to_html(index=False, escape=False).replace("\\n", "<br>"),
                 unsafe_allow_html=True
             )
-            st.write(f"Total Resumes Processed: {len(file_paths)}")
+            
+            # Add summary of results
+            st.subheader("Processing Summary")
+            st.write(f"Total Resumes: {len(file_paths)}")
             st.write(f"Matching Resumes: {len(matching_resumes)}")
+            st.write(f"Rejected Resumes: {len(file_paths) - len(matching_resumes)}")
+            
         else:
             st.warning("No resumes matched the criteria.")
