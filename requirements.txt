@@ -1,4 +1,4 @@
-﻿fastapi
+fastapi
 uvicorn
 PyPDF2
 asyncpg
@@ -7,4 +7,4 @@ torch
 streamlit
 PyPDF2
 google-generativeai
-pdfplumber
+ pdfplumber
