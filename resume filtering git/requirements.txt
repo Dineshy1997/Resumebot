@@ -1,0 +1,7 @@
+streamlit
+pdfplumber
+google-generativeai
+pandas
+streamlit-extras
+streamlit-lottie
+requests
